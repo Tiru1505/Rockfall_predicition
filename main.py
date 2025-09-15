@@ -7,8 +7,8 @@ import pandas as pd
 import joblib
 import sqlite3
 import smtplib
-from email.mime.text import MimeText
-from email.mime.multipart import MimeMultipart
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 import json
 import logging
