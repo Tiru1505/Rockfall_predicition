@@ -1,0 +1,271 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import folium
+from streamlit_folium import st_folium
+import requests
+from datetime import datetime, timedelta
+import json
+import io
+from typing import Dict, List
+import time
+
+# Page configuration
+st.set_page_config(
+    page_title="Rockfall Prediction Dashboard",
+    page_icon="⛰️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS
+st.markdown("""
+<style>
+.metric-card {
+    background-color: #f0f2f6;
+    padding: 1rem;
+    border-radius: 0.5rem;
+    border-left: 4px solid #1f77b4;
+}
+.critical { border-left-color: #d62728 !important; }
+.high { border-left-color: #ff7f0e !important; }
+.medium { border-left-color: #ffbb78 !important; }
+.low { border-left-color: #2ca02c !important; }
+.minimal { border-left-color: #98df8a !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# Configuration
+API_BASE_URL = "http://localhost:8000"
+
+# Initialize session state
+if 'last_update' not in st.session_state:
+    st.session_state.last_update = None
+if 'alert_config' not in st.session_state:
+    st.session_state.alert_config = {}
+
+def make_api_request(endpoint: str, method: str = "GET", data: Dict = None):
+    """Make API request with error handling"""
+    try:
+        url = f"{API_BASE_URL}{endpoint}"
+        if method == "GET":
+            response = requests.get(url, timeout=10)
+        elif method == "POST":
+            response = requests.post(url, json=data, timeout=10)
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.error(f"API Error: {response.status_code} - {response.text}")
+            return None
+    except requests.exceptions.ConnectionError:
+        st.error("Unable to connect to API. Please ensure the FastAPI server is running on localhost:8000")
+        return None
+    except Exception as e:
+        st.error(f"Request failed: {str(e)}")
+        return None
+
+def get_risk_color(risk_level: str) -> str:
+    """Get color for risk level"""
+    colors = {
+        "CRITICAL": "#d62728",
+        "HIGH": "#ff7f0e", 
+        "MEDIUM": "#ffbb78",
+        "LOW": "#2ca02c",
+        "MINIMAL": "#98df8a"
+    }
+    return colors.get(risk_level, "#1f77b4")
+
+def create_risk_heatmap(predictions_data: List[Dict]) -> folium.Map:
+    """Create folium risk heatmap"""
+    if not predictions_data:
+        # Default map centered on Australia (mining country)
+        m = folium.Map(location=[-25.2744, 133.7751], zoom_start=5)
+        return m
+    
+    # Get latest prediction for each site
+    site_latest = {}
+    for pred in predictions_data:
+        site_id = pred['site_id']
+        if site_id not in site_latest or pred['timestamp'] > site_latest[site_id]['timestamp']:
+            site_latest[site_id] = pred
+    
+    # Create map centered on mean coordinates
+    lats = [float(pred.get('latitude', -25.2744)) for pred in site_latest.values()]
+    lons = [float(pred.get('longitude', 133.7751)) for pred in site_latest.values()]
+    
+    center_lat = np.mean(lats) if lats else -25.2744
+    center_lon = np.mean(lons) if lons else 133.7751
+    
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=8)
+    
+    # Add markers for each site
+    for pred in site_latest.values():
+        lat = float(pred.get('latitude', center_lat))
+        lon = float(pred.get('longitude', center_lon))
+        
+        risk_level = pred.get('risk_level', 'MINIMAL')
+        probability = pred.get('rockfall_probability', 0)
+        
+        color = get_risk_color(risk_level).replace('#', '')
+        
+        popup_text = f"""
+        <b>Site:</b> {pred['site_id']}<br>
+        <b>Risk Level:</b> {risk_level}<br>
+        <b>Probability:</b> {probability:.2%}<br>
+        <b>Time:</b> {pred['timestamp']}<br>
+        <b>Confidence:</b> {pred.get('confidence', 0):.2%}
+        """
+        
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=max(10, probability * 20),
+            popup=folium.Popup(popup_text, max_width=300),
+            color=f"#{color}",
+            fill=True,
+            fillColor=f"#{color}",
+            fillOpacity=0.7,
+            weight=2
+        ).add_to(m)
+    
+    return m
+
+def create_time_series_chart(sensor_data: List[Dict], prediction_data: List[Dict]):
+    """Create time series charts for sensor data and predictions"""
+    if not sensor_data:
+        return go.Figure().add_annotation(text="No sensor data available", 
+                                        xref="paper", yref="paper", x=0.5, y=0.5)
+    
+    df_sensors = pd.DataFrame(sensor_data)
+    df_sensors['timestamp'] = pd.to_datetime(df_sensors['timestamp'])
+    df_sensors = df_sensors.sort_values('timestamp')
+    
+    # Create subplots
+    fig = make_subplots(
+        rows=3, cols=2,
+        subplot_titles=('Temperature & Humidity', 'Rainfall & Water Content',
+                       'Slope Angle & Rock Strength', 'Vibration & Wind Speed',
+                       'Joint Properties', 'Rockfall Probability'),
+        specs=[[{"secondary_y": True}, {"secondary_y": True}],
+               [{"secondary_y": True}, {"secondary_y": True}],
+               [{"secondary_y": True}, {"secondary_y": False}]]
+    )
+    
+    # Temperature & Humidity
+    fig.add_trace(
+        go.Scatter(x=df_sensors['timestamp'], y=df_sensors['temperature'], 
+                  name='Temperature (°C)', line=dict(color='red')),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=df_sensors['timestamp'], y=df_sensors['humidity'], 
+                  name='Humidity (%)', line=dict(color='blue')),
+        row=1, col=1, secondary_y=True
+    )
+    
+    # Rainfall & Water Content
+    fig.add_trace(
+        go.Scatter(x=df_sensors['timestamp'], y=df_sensors['rainfall'], 
+                  name='Rainfall (mm)', line=dict(color='lightblue'), fill='tonexty'),
+        row=1, col=2
+    )
+    fig.add_trace(
+        go.Scatter(x=df_sensors['timestamp'], y=df_sensors['water_content'], 
+                  name='Water Content (%)', line=dict(color='darkblue')),
+        row=1, col=2, secondary_y=True
+    )
+    
+    # Slope & Rock Strength
+    fig.add_trace(
+        go.Scatter(x=df_sensors['timestamp'], y=df_sensors['slope_angle'], 
+                  name='Slope Angle (°)', line=dict(color='orange')),
+        row=2, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=df_sensors['timestamp'], y=df_sensors['rock_strength'], 
+                  name='Rock Strength (MPa)', line=dict(color='brown')),
+        row=2, col=1, secondary_y=True
+    )
+    
+    # Vibration & Wind
+    fig.add_trace(
+        go.Scatter(x=df_sensors['timestamp'], y=df_sensors['vibration_intensity'], 
+                  name='Vibration', line=dict(color='purple')),
+        row=2, col=2
+    )
+    fig.add_trace(
+        go.Scatter(x=df_sensors['timestamp'], y=df_sensors['wind_speed'], 
+                  name='Wind Speed (m/s)', line=dict(color='green')),
+        row=2, col=2, secondary_y=True
+    )
+    
+    # Joint Properties
+    fig.add_trace(
+        go.Scatter(x=df_sensors['timestamp'], y=df_sensors['joint_spacing'], 
+                  name='Joint Spacing (cm)', line=dict(color='gray')),
+        row=3, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=df_sensors['timestamp'], y=df_sensors['joint_orientation'], 
+                  name='Joint Orientation (°)', line=dict(color='black')),
+        row=3, col=1, secondary_y=True
+    )
+    
+    # Rockfall Probability
+    if prediction_data:
+        df_pred = pd.DataFrame(prediction_data)
+        df_pred['timestamp'] = pd.to_datetime(df_pred['timestamp'])
+        df_pred = df_pred.sort_values('timestamp')
+        
+        colors = [get_risk_color(risk) for risk in df_pred['risk_level']]
+        
+        fig.add_trace(
+            go.Scatter(x=df_pred['timestamp'], y=df_pred['rockfall_probability'], 
+                      name='Rockfall Probability', line=dict(color='red', width=3),
+                      marker=dict(color=colors, size=8)),
+            row=3, col=2
+        )
+        
+        # Add risk level zones
+        fig.add_hline(y=0.8, line_dash="dash", line_color="red", 
+                     annotation_text="Critical", row=3, col=2)
+        fig.add_hline(y=0.6, line_dash="dash", line_color="orange", 
+                     annotation_text="High", row=3, col=2)
+        fig.add_hline(y=0.4, line_dash="dash", line_color="yellow", 
+                     annotation_text="Medium", row=3, col=2)
+        fig.add_hline(y=0.2, line_dash="dash", line_color="lightgreen", 
+                     annotation_text="Low", row=3, col=2)
+    
+    fig.update_layout(height=800, showlegend=True, title_text="Sensor Data and Risk Analysis")
+    return fig
+
+def create_risk_gauge(probability: float, risk_level: str):
+    """Create risk gauge chart"""
+    fig = go.Figure(go.Indicator(
+        mode = "gauge+number+delta",
+        value = probability * 100,
+        domain = {'x': [0, 1], 'y': [0, 1]},
+        title = {'text': f"Rockfall Risk<br><span style='font-size:0.8em;color:gray'>Level: {risk_level}</span>"},
+        delta = {'reference': 50},
+        gauge = {
+            'axis': {'range': [None, 100]},
+            'bar': {'color': get_risk_color(risk_level)},
+            'steps': [
+                {'range': [0, 20], 'color': "#98df8a"},
+                {'range': [20, 40], 'color': "#ffbb78"},
+                {'range': [40, 60], 'color': "#ff7f0e"},
+                {'range': [60, 80], 'color': "#d62728"},
+                {'range': [80, 100], 'color': "#8b0000"}
+            ],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': 90
+            }
+        }
+    ))
+    
+    fig.update_layout(height=300
